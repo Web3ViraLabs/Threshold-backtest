@@ -1,0 +1,226 @@
+{
+  "config": {
+    "symbol": "ETHUSDT",
+    "threshold": 10,
+    "num_previous_candles": 72,
+    "initial_balance": 10000
+  },
+  "trade_performance": {
+    "total_trades": 2,
+    "profitable_trades": 1,
+    "unprofitable_trades": 1,
+    "win_rate": "50.00%",
+    "by_direction": {
+      "long": {
+        "total_trades": ,
+        "profitable_trades": , 
+        "total_pnl": " USDT"
+      },
+      "short": {
+        "total_trades": ,
+        "profitable_trades": , 
+        "total_pnl": " USDT"
+      }
+    }
+  },
+  "detailed_trades": [
+    {
+      "trade_Number":01,
+      "timestamp": "2024-05-20 17:30:00",
+      "LegendCandle":{
+        "currentDynamicThreshold": "",
+        "LegendCandleDifference": "currentDiff of legend Candle",
+        "LegendCandleDetails":{
+          "open": "",
+          "high": "",
+          "low":"",
+          "close":"",
+          "volume":""
+        }
+      },
+      "entry": {
+        "reason" : "UpwardThresholdMet/DownwardThresholdMet",
+        "side": "LONG/SHORT",
+        "price": 3136.7241291648593,
+        "formatted_price": "3136.72 USDT",
+        "time": "2024-07-04 05:30:00",
+        "PositionEntryCandleDetails":{
+          "open":"",
+          "high":"",
+          "low":"",
+          "close":"",
+          "volume":""
+        },
+        "initial_stop": {
+          "price": "3588.41",
+          "distance_from_entry": "-451.68 USDT",
+          "percentage_from_entry": "-14.40%"
+        }
+        },
+      "trailing_details": {
+        
+        "trails": [
+          {
+            "trail_number": 1,
+            "time": "2024-08-04 17:30:00",
+            "triggerValue":"3198",
+            "old_stop_loss": "3136.72",
+            "new_stop_loss": "2685.04",
+            "stop_loss_movement": "16.69%",
+            "profit_at_this_trail": "451.68 USDT",
+            "TriggerCandleDetails":{
+                 "open":"",
+                 "high":"",
+                 "low":"",
+                 "close":"",
+                 "volume":""
+        },
+            "trail_details": {
+              "triggered_by": "trigger01",
+              "stoploss_distanceFrom_entry": "0%",
+              "profit_so_far": "0 USDT"
+            }
+          },
+          {
+            "trail_number": 2,
+            "time": "2024-08-04 17:30:00",
+            "triggerValue":"3198",
+            "old_stop_loss": "3136.72",
+            "new_stop_loss": "2685.04",
+            "stop_loss_movement": "16.69%",
+            "profit_at_this_trail": "451.68 USDT",
+            "TriggerCandleDetails":{
+                 "open":"",
+                 "high":"",
+                 "low":"",
+                 "close":"",
+                 "volume":""
+        },
+            "trail_details": {
+              "triggered_by": "trigger02",
+              "stoploss_distanceFrom_entry": "16.69%",
+              "profit_so_far": "451.68 USDT"
+            }
+          }
+        ],
+        "exit_details": {
+          "time": "2024-08-08 17:30:00",
+          "exit_reason": "initialStoploss hit/ stoploss 01 hit/ stoploss 02 hit/ stoploss 03 hit /.........",
+          "final_stop_loss_price": "2685.04",
+          "total_trails_before_exit": 2,
+          "PNL_in_%": "16.69%",
+          "PNL": "451.68 USDT"
+          
+        },
+        "trade_summary": {
+          "entry_price": 3136.7241291648593,
+          "initialStoploss": "301.12",
+          "numberOfTrails": 2,
+          "final_stop_loss_price": "2685.04",
+          "PNL_in_%": "16.69%",
+          "PNL": "451.68 USDT"
+        }
+      },
+      "balance_after_trade": 10268.336184302178
+    },
+    {
+      "trade_Number":02,
+      "timestamp": "2024-05-20 17:30:00",
+      "LegendCandle":{
+        "currentDynamicThreshold": "",
+        "LegendCandleDifference": "currentDiff of legend Candle",
+        "LegendCandleDetails":{
+          "open": "",
+          "high": "",
+          "low":"",
+          "close":"",
+          "volume":""
+        }
+      },
+      "entry": {
+        "reason" : "UpwardThresholdMet/DownwardThresholdMet",
+        "side": "LONG/SHORT",
+        "price": 3136.7241291648593,
+        "formatted_price": "3136.72 USDT",
+        "time": "2024-07-04 05:30:00",
+        "PositionEntryCandleDetails":{
+          "open":"",
+          "high":"",
+          "low":"",
+          "close":"",
+          "volume":""
+        },
+        "initial_stop": {
+          "price": "3588.41",
+          "distance_from_entry": "-451.68 USDT",
+          "percentage_from_entry": "-14.40%"
+        }
+        },
+      "trailing_details": {
+        
+        "trails": [
+          {
+            "trail_number": 1,
+            "time": "2024-08-04 17:30:00",
+            "triggerValue":"3198",
+            "old_stop_loss": "3136.72",
+            "new_stop_loss": "2685.04",
+            "stop_loss_movement": "16.69%",
+            "profit_at_this_trail": "451.68 USDT",
+            "TriggerCandleDetails":{
+                 "open":"",
+                 "high":"",
+                 "low":"",
+                 "close":"",
+                 "volume":""
+        },
+            "trail_details": {
+              "triggered_by": "trigger01",
+              "stoploss_distanceFrom_entry": "0%",
+              "profit_so_far": "0 USDT"
+            }
+          },
+          {
+            "trail_number": 2,
+            "time": "2024-08-04 17:30:00",
+            "triggerValue":"3198",
+            "old_stop_loss": "3136.72",
+            "new_stop_loss": "2685.04",
+            "stop_loss_movement": "16.69%",
+            "profit_at_this_trail": "451.68 USDT",
+            "TriggerCandleDetails":{
+                 "open":"",
+                 "high":"",
+                 "low":"",
+                 "close":"",
+                 "volume":""
+        },
+            "trail_details": {
+              "triggered_by": "trigger02",
+              "stoploss_distanceFrom_entry": "16.69%",
+              "profit_so_far": "451.68 USDT"
+            }
+          }
+        ],
+        "exit_details": {
+          "time": "2024-08-08 17:30:00",
+          "exit_reason": "initialStoploss hit/ stoploss 01 hit/ stoploss 02 hit/ stoploss 03 hit /.........",
+          "final_stop_loss_price": "2685.04",
+          "total_trails_before_exit": 2,
+          "PNL_in_%": "16.69%",
+          "PNL": "451.68 USDT"
+          
+        },
+        "trade_summary": {
+          "entry_price": 3136.7241291648593,
+          "initialStoploss": "301.12",
+          "numberOfTrails": 2,
+          "final_stop_loss_price": "2685.04",
+          "PNL_in_%": "16.69%",
+          "PNL": "451.68 USDT"
+        }
+      },
+      "balance_after_trade": 10268.336184302178
+    }
+  ]
+}

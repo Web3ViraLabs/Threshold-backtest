@@ -11,8 +11,9 @@ import {
   MatchingCandle,
   BalanceUpdate,
   TradeExit,
+  TradeDetailsResult,
 } from './interfaces';
-import config from './config';
+import config, { TradingConfig } from './config';
 
 interface TriggerLevel {
   trigger: number;
@@ -24,42 +25,164 @@ interface TriggerLevel {
 export class Backtester {
   private candles: Candle[] = [];
   private matchingCandles: MatchingCandle[] = [];
-  private symbol: string;
   private currentBalance: number;
   private balanceHistory: BalanceUpdate[] = [];
 
-  constructor(symbol: string) {
-    this.symbol = symbol;
-    this.currentBalance = config.account.initialBalance;
-
-    if (!config.pairs[symbol]?.enabled) {
-      throw new Error(`Trading pair ${symbol} is not enabled in config`);
-    }
+  constructor(
+    private symbol: string,
+    private runConfig: TradingConfig = config
+  ) {
+    this.currentBalance = runConfig.account.initialBalance;
   }
 
   async loadData(csvFilePath: string): Promise<void> {
     return new Promise((resolve, reject) => {
+      const startTimestamp = new Date(
+        this.runConfig.dataFetch.startDate.year,
+        this.runConfig.dataFetch.startDate.month - 1
+      ).getTime();
+
+      const endTimestamp = this.runConfig.dataFetch.endDate 
+        ? new Date(
+            this.runConfig.dataFetch.endDate.year,
+            this.runConfig.dataFetch.endDate.month - 1
+          ).getTime()
+        : new Date().getTime();
+
       fs.createReadStream(csvFilePath)
         .pipe(csv())
         .on('data', (row) => {
-          const candle: Candle = {
-            openTime: parseInt(row.open_time),
-            open: parseFloat(row.open),
-            high: parseFloat(row.high),
-            low: parseFloat(row.low),
-            close: parseFloat(row.close),
-            volume: parseFloat(row.volume),
-            closeTime: parseInt(row.close_time),
-          };
-          this.candles.push(candle);
+          const candleTimestamp = parseInt(row.open_time);
+          
+          // Only include candles within the specified date range
+          if (candleTimestamp >= startTimestamp && candleTimestamp <= endTimestamp) {
+            const candle: Candle = {
+              openTime: candleTimestamp,
+              open: parseFloat(row.open),
+              high: parseFloat(row.high),
+              low: parseFloat(row.low),
+              close: parseFloat(row.close),
+              volume: parseFloat(row.volume),
+              closeTime: parseInt(row.close_time),
+            };
+            this.candles.push(candle);
+          }
         })
         .on('end', () => {
           const fileName = path.basename(csvFilePath);
-          console.log(`Loaded ${this.candles.length} candles from ${fileName}`);
+          console.log(`Loaded ${this.candles.length} candles from ${fileName} within date range ${
+            moment(startTimestamp).format('YYYY-MM-DD')} to ${
+            moment(endTimestamp).format('YYYY-MM-DD')
+          }`);
           resolve();
         })
         .on('error', reject);
     });
+  }
+
+  private async processCandle(
+    currentCandle: Candle,
+    lookbackCandles: Candle[],
+    currentIndex: number
+  ): Promise<void> {
+    // Get previous candles for average calculation
+    const previousCandles = lookbackCandles.slice(
+      -this.runConfig.strategy.lookbackPeriod.candles
+    );
+
+    // Calculate current candle's movement percentage
+    const currentDiff = (Math.abs(currentCandle.close - currentCandle.open) / 
+      currentCandle.open) * 100;
+
+    // Calculate average movement of previous candles
+    const previousDiffs = previousCandles.map(
+      (candle) => Math.abs((candle.close - candle.open) / candle.open) * 100
+    );
+    const averageDiff = math.mean(previousDiffs);
+    const dynamicThreshold = this.runConfig.strategy.lookbackPeriod.threshold * averageDiff;
+
+    console.log(`
+🔍 Checking candle at ${moment(currentCandle.openTime).format('YYYY-MM-DD HH:mm:ss')}
+Movement: ${currentDiff.toFixed(2)}%
+Average Movement: ${averageDiff.toFixed(2)}%
+Dynamic Threshold: ${dynamicThreshold.toFixed(2)}%`);
+
+    if (currentDiff >= dynamicThreshold) {
+      // This is a legend candle
+      const thresholdValue = currentCandle.close * (dynamicThreshold / 100);
+      const legendCandle = {
+        timestamp: moment(currentCandle.openTime).format('YYYY-MM-DD HH:mm:ss'),
+        close: currentCandle.close,
+        upward_movementThreshold: currentCandle.close + thresholdValue,
+        downward_movementThreshold: currentCandle.close - thresholdValue,
+        // Store the full candle data
+        candleData: {
+          open: currentCandle.open,
+          high: currentCandle.high,
+          low: currentCandle.low,
+          close: currentCandle.close,
+          volume: currentCandle.volume
+        }
+      };
+
+      console.log(`
+✨ LEGEND CANDLE FOUND!
+Time: ${legendCandle.timestamp}
+Close: ${legendCandle.close}
+Upward Threshold: ${legendCandle.upward_movementThreshold}
+Downward Threshold: ${legendCandle.downward_movementThreshold}`);
+
+      // Check for threshold crossing
+      const threshold_crossed = await this.checkThresholdCrossing(
+        currentIndex,
+        legendCandle
+      );
+
+      if (threshold_crossed.direction !== 'NONE') {
+        // Calculate position size
+        const tradeSize = this.calculateTradeSize(threshold_crossed.entry_price);
+
+        // Check trade outcome
+        const exit = await this.checkTradeOutcome(
+          currentIndex + threshold_crossed.candles_until_cross,
+          {
+            price: threshold_crossed.entry_price,
+            side: threshold_crossed.direction as 'LONG' | 'SHORT',
+            size: tradeSize,
+            dynamicThreshold
+          }
+        );
+
+        if (exit) {
+          const tradeResult = this.processTradeResult(
+            {
+              ...threshold_crossed,
+              direction: threshold_crossed.direction as 'LONG' | 'SHORT'
+            },
+            exit,
+            dynamicThreshold,
+            currentDiff,
+            legendCandle.candleData  // Pass the stored legend candle data
+          );
+
+          // Update balance
+          this.updateBalance(tradeResult);
+
+          // Store matching candle info with type-safe threshold_crossed
+          this.storeMatchingCandle(
+            currentCandle,
+            legendCandle,
+            {
+              ...threshold_crossed,
+              direction: threshold_crossed.direction as 'LONG' | 'SHORT'
+            },
+            tradeResult,
+            dynamicThreshold,
+            averageDiff
+          );
+        }
+      }
+    }
   }
 
   private async checkThresholdCrossing(
@@ -75,38 +198,48 @@ export class Backtester {
     crossed_at: string;
     entry_price: number;
     candles_until_cross: number;
+    entryCandleData?: {
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    };
   }> {
-    // Look ahead up to 30 days (720 hours)
-    const lookForward = Math.min(720, this.candles.length - startIndex);
-
-    for (let i = 1; i <= lookForward; i++) {
-      if (startIndex + i >= this.candles.length) {
-        return {
-          direction: 'NONE',
-          crossed_at: '',
-          entry_price: 0,
-          candles_until_cross: 0,
-        };
-      }
+    for (let i = 1; i <= this.runConfig.trade.maxLookForwardCandles; i++) {
+      if (startIndex + i >= this.candles.length) break;
 
       const candle = this.candles[startIndex + i];
 
-      // Check which threshold is crossed first
-      if (candle.high > legendCandle.upward_movementThreshold) {
+      if (candle.high >= legendCandle.upward_movementThreshold) {
         return {
           direction: 'LONG',
           crossed_at: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
           entry_price: legendCandle.upward_movementThreshold,
           candles_until_cross: i,
+          entryCandleData: {
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume
+          }
         };
       }
 
-      if (candle.low < legendCandle.downward_movementThreshold) {
+      if (candle.low <= legendCandle.downward_movementThreshold) {
         return {
           direction: 'SHORT',
           crossed_at: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
           entry_price: legendCandle.downward_movementThreshold,
           candles_until_cross: i,
+          entryCandleData: {
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume
+          }
         };
       }
     }
@@ -115,7 +248,7 @@ export class Backtester {
       direction: 'NONE',
       crossed_at: '',
       entry_price: 0,
-      candles_until_cross: 0,
+      candles_until_cross: 0
     };
   }
 
@@ -125,31 +258,40 @@ export class Backtester {
     dynamicThreshold: number
   ): TriggerLevel[] {
     const levels: TriggerLevel[] = [];
-    const thresholdMultiplier = dynamicThreshold / 100;
+    const thresholdValue = entryPrice * (dynamicThreshold / 100);
 
-    // Calculate 20 trigger levels
-    for (let i = 1; i <= 20; i++) {
+    // Initial stop loss is always entry ± thresholdValue based on side
+    const initialLevel: TriggerLevel = {
+      trigger: entryPrice,
+      stopLoss: side === 'LONG' 
+        ? entryPrice - thresholdValue 
+        : entryPrice + thresholdValue,
+      triggered: true,  // Initial level is always triggered
+      hit: false
+    };
+    levels.push(initialLevel);
+
+    // Calculate subsequent trigger levels
+    for (let i = 1; i <= this.runConfig.trade.trailingStop.maxTriggerLevels; i++) {
       if (side === 'LONG') {
-        // For LONG positions
-        const trigger = entryPrice * (1 + thresholdMultiplier * i);
-        const stopLoss = entryPrice * (1 + thresholdMultiplier * (i - 1));
-
+        const trigger = entryPrice + (thresholdValue * i);
+        const stopLoss = trigger - thresholdValue;  // Using original thresholdValue
+        
         levels.push({
           trigger,
           stopLoss,
           triggered: false,
-          hit: false,
+          hit: false
         });
-      } else {
-        // For SHORT positions
-        const trigger = entryPrice * (1 - thresholdMultiplier * i);
-        const stopLoss = entryPrice * (1 - thresholdMultiplier * (i - 1));
-
+      } else {  // SHORT
+        const trigger = entryPrice - (thresholdValue * i);
+        const stopLoss = trigger + thresholdValue;  // Using original thresholdValue
+        
         levels.push({
           trigger,
           stopLoss,
           triggered: false,
-          hit: false,
+          hit: false
         });
       }
     }
@@ -166,141 +308,56 @@ export class Backtester {
       dynamicThreshold: number;
     }
   ): Promise<TradeExit | null> {
-    // Calculate trigger levels using dynamicThreshold
     const triggerLevels = this.calculateTriggerLevels(
       entry.price,
       entry.side,
       entry.dynamicThreshold
     );
 
-    // Initial stop loss using dynamicThreshold
-    let currentStopLoss = entry.side === 'LONG'
-      ? entry.price * (1 - entry.dynamicThreshold / 100)
-      : entry.price * (1 + entry.dynamicThreshold / 100);
+    let currentStopLoss = triggerLevels[0].stopLoss;
+    let currentTriggerIndex = 1;
 
-    let currentTriggerIndex = 0;
-    let nextTriggerLevel = triggerLevels[currentTriggerIndex];
+    const trailingHistory: (TrailingStopUpdate & { triggerCandle?: Candle })[] = [{
+      price: currentStopLoss,
+      time: moment(this.candles[startIndex].openTime).format('YYYY-MM-DD HH:mm:ss'),
+      type: 'INITIAL',
+      market_price: entry.price,
+      profit_at_update: 0
+    }];
 
-    const trailingHistory: TrailingStopUpdate[] = [
-      {
-        price: currentStopLoss,
-        time: moment(this.candles[startIndex].openTime).format(
-          'YYYY-MM-DD HH:mm:ss'
-        ),
-        type: 'INITIAL',
-        market_price: entry.price,
-        profit_at_update: 0,
-      },
-    ];
-
-    // For each candle, check both stop loss and next trigger
-    for (let i = 1; i <= config.trade.maxLookForwardCandles; i++) {
+    for (let i = 1; i <= this.runConfig.trade.maxLookForwardCandles; i++) {
       if (startIndex + i >= this.candles.length) return null;
       const candle = this.candles[startIndex + i];
 
-      if (entry.side === 'LONG') {
-        // For LONG positions:
-        // 1. Check if stop loss is hit (using low price for worst case)
-        if (candle.low <= currentStopLoss) {
-          console.log(`
-🛑 STOP LOSS HIT (LONG):
-Time: ${moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss')}
-Stop Loss: ${currentStopLoss.toFixed(2)}
-Hit Price (Low): ${candle.low.toFixed(2)}
-Candle Range: ${candle.low.toFixed(2)} - ${candle.high.toFixed(2)}
-                  `);
+      // Check stop loss hit
+      if (entry.side === 'LONG' && candle.low <= currentStopLoss) {
+        return this.createTradeExit(candle, currentStopLoss, i, trailingHistory);
+      }
+      if (entry.side === 'SHORT' && candle.high >= currentStopLoss) {
+        return this.createTradeExit(candle, currentStopLoss, i, trailingHistory);
+      }
 
+      // Check trigger levels
+      while (currentTriggerIndex < triggerLevels.length) {
+        const nextTrigger = triggerLevels[currentTriggerIndex];
+        
+        if ((entry.side === 'LONG' && candle.high >= nextTrigger.trigger) ||
+            (entry.side === 'SHORT' && candle.low <= nextTrigger.trigger)) {
+          
+          currentStopLoss = nextTrigger.stopLoss;
           trailingHistory.push({
             price: currentStopLoss,
             time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
-            type: 'HIT',
-            market_price: candle.low,  // Using low price that triggered stop loss
-            profit_at_update: ((currentStopLoss - entry.price) / entry.price) * 100
+            type: entry.side === 'LONG' ? 'TRAIL_UP' : 'TRAIL_DOWN',
+            market_price: entry.side === 'LONG' ? candle.high : candle.low,
+            profit_at_update: ((entry.side === 'LONG' ? 1 : -1) * 
+              (nextTrigger.trigger - entry.price) / entry.price) * 100,
+            triggerCandle: candle  // Store the trigger candle
           });
-
-          return {
-            price: currentStopLoss,
-            time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
-            type: 'TRAILING_STOP',
-            candles_until_exit: i,
-            trailing_stops: trailingHistory
-          };
-        }
-
-        // 2. Check if new trigger is hit (using high price for best case)
-        if (currentTriggerIndex < triggerLevels.length && 
-            candle.high >= nextTriggerLevel.trigger) {
-          console.log(`
-🎯 TRIGGER ${currentTriggerIndex + 1} HIT (LONG):
-Time: ${moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss')}
-Trigger Level: ${nextTriggerLevel.trigger.toFixed(2)}
-Hit Price (High): ${candle.high.toFixed(2)}
-Candle Range: ${candle.low.toFixed(2)} - ${candle.high.toFixed(2)}
-                  `);
-
-          currentStopLoss = nextTriggerLevel.stopLoss;
-          trailingHistory.push({
-            price: currentStopLoss,
-            time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
-            type: 'TRAIL_UP',
-            market_price: candle.high,  // Using high price that triggered update
-            profit_at_update: ((candle.high - entry.price) / entry.price) * 100
-          });
-
+          
           currentTriggerIndex++;
-          nextTriggerLevel = triggerLevels[currentTriggerIndex];
-        }
-      } else {
-        // For SHORT positions:
-        // 1. Check if stop loss is hit (using high price for worst case)
-        if (candle.high >= currentStopLoss) {
-          console.log(`
-🛑 STOP LOSS HIT (SHORT):
-Time: ${moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss')}
-Stop Loss: ${currentStopLoss.toFixed(2)}
-Hit Price (High): ${candle.high.toFixed(2)}
-Candle Range: ${candle.low.toFixed(2)} - ${candle.high.toFixed(2)}
-                  `);
-
-          trailingHistory.push({
-            price: currentStopLoss,
-            time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
-            type: 'HIT',
-            market_price: candle.high,  // Using high price that triggered stop loss
-            profit_at_update: ((entry.price - currentStopLoss) / entry.price) * 100
-          });
-
-          return {
-            price: currentStopLoss,
-            time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
-            type: 'TRAILING_STOP',
-            candles_until_exit: i,
-            trailing_stops: trailingHistory
-          };
-        }
-
-        // 2. Check if new trigger is hit (using low price for best case)
-        if (currentTriggerIndex < triggerLevels.length && 
-            candle.low <= nextTriggerLevel.trigger) {
-          console.log(`
-🎯 TRIGGER ${currentTriggerIndex + 1} HIT (SHORT):
-Time: ${moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss')}
-Trigger Level: ${nextTriggerLevel.trigger.toFixed(2)}
-Hit Price (Low): ${candle.low.toFixed(2)}
-Candle Range: ${candle.low.toFixed(2)} - ${candle.high.toFixed(2)}
-                  `);
-
-          currentStopLoss = nextTriggerLevel.stopLoss;
-          trailingHistory.push({
-            price: currentStopLoss,
-            time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
-            type: 'TRAIL_DOWN',
-            market_price: candle.low,  // Using low price that triggered update
-            profit_at_update: ((entry.price - candle.low) / entry.price) * 100
-          });
-
-          currentTriggerIndex++;
-          nextTriggerLevel = triggerLevels[currentTriggerIndex];
+        } else {
+          break;
         }
       }
     }
@@ -335,204 +392,294 @@ Candle Range: ${candle.low.toFixed(2)} - ${candle.high.toFixed(2)}
     });
   }
 
-  private async processCandle(
-    currentCandle: Candle,
-    lookbackCandles: Candle[],
-    currentIndex: number
-  ): Promise<void> {
-    // Use config values
-    const previousCandles = lookbackCandles.slice(
-      -config.lookbackPeriod.candles
-    );
-    const currentDiff =
-      (math.abs(currentCandle.close - currentCandle.open) /
-        currentCandle.open) *
-      100;
-
-    const previousDiffs = previousCandles.map(
-      (candle) => math.abs((candle.close - candle.open) / candle.open) * 100
-    );
-
-    const averageDiff = math.mean(previousDiffs);
-    const dynamicThreshold = config.lookbackPeriod.threshold * averageDiff;
-
-    console.log(`
-🔍 Checking candle at ${moment(currentCandle.openTime).format(
-      'YYYY-MM-DD HH:mm:ss'
-    )}
-Open: ${currentCandle.open} | Close: ${currentCandle.close}
-Movement: ${currentDiff.toFixed(2)}%
-Previous ${config.lookbackPeriod.candles} candles avg: ${averageDiff.toFixed(
-      2
-    )}%
-Required: >${dynamicThreshold.toFixed(2)}%`);
-    if (currentDiff > dynamicThreshold) {
-      // This is a legendCandle
-      const thresholdPercentage = dynamicThreshold / 100;
-      const legendCandle = {
-        timestamp: moment(currentCandle.openTime).format('YYYY-MM-DD HH:mm:ss'),
-        close: currentCandle.close,
-        upward_movementThreshold:
-          currentCandle.close * (1 + thresholdPercentage),
-        downward_movementThreshold:
-          currentCandle.close * (1 - thresholdPercentage),
-      };
-
-      console.log(`✅ LEGEND CANDLE FOUND!
-            Time: ${legendCandle.timestamp}
-            Close Price: ${legendCandle.close}
-            Movement: ${currentDiff.toFixed(2)}%
-            Dynamic Threshold: ${dynamicThreshold.toFixed(2)}%
-            
-            ENTRY LEVELS:
-            LONG → Above ${legendCandle.upward_movementThreshold.toFixed(
-              2
-            )} USDT
-            SHORT → Below ${legendCandle.downward_movementThreshold.toFixed(
-              2
-            )} USDT`);
-
-      // Check which threshold is crossed first
-      const threshold_crossed = await this.checkThresholdCrossing(
-        currentIndex,
-        legendCandle
-      );
-
-      if (threshold_crossed.direction !== 'NONE') {
-        // Calculate position size based on current balance
-        const tradeSize = this.calculateTradeSize(
-          threshold_crossed.entry_price
-        );
-
-        // Check trade outcome with actual position size
-        const exit = await this.checkTradeOutcome(
-          currentIndex + threshold_crossed.candles_until_cross,
-          {
-            price: threshold_crossed.entry_price,
-            side: threshold_crossed.direction,
-            size: tradeSize,
-            dynamicThreshold: dynamicThreshold
+  private async saveResults(results: any): Promise<void> {
+    const formattedResults = {
+      config: {
+        symbol: this.symbol,
+        threshold: this.runConfig.strategy.lookbackPeriod.threshold,
+        num_previous_candles: this.runConfig.strategy.lookbackPeriod.candles,
+        initial_balance: this.runConfig.account.initialBalance
+      },
+      trade_performance: {
+        total_trades: this.matchingCandles.length,
+        profitable_trades: this.matchingCandles.filter(
+          c => c.trade_result && parseFloat(c.trade_result.trailing_details.trade_summary.PNL) > 0
+        ).length,
+        unprofitable_trades: this.matchingCandles.filter(
+          c => c.trade_result && parseFloat(c.trade_result.trailing_details.trade_summary.PNL) <= 0
+        ).length,
+        win_rate: ((this.matchingCandles.filter(
+          c => c.trade_result && parseFloat(c.trade_result.trailing_details.trade_summary.PNL) > 0
+        ).length / this.matchingCandles.length) * 100).toFixed(2) + '%',
+        by_direction: {
+          long: {
+            total_trades: this.matchingCandles.filter(
+              c => c.trade_result?.entry.side === 'LONG'
+            ).length,
+            profitable_trades: this.matchingCandles.filter(
+              c => c.trade_result?.entry.side === 'LONG' && 
+                parseFloat(c.trade_result.trailing_details.trade_summary.PNL) > 0
+            ).length,
+            total_pnl: this.matchingCandles
+              .filter(c => c.trade_result?.entry.side === 'LONG')
+              .reduce((sum, trade) => 
+                sum + (trade.trade_result ? parseFloat(trade.trade_result.trailing_details.trade_summary.PNL) : 0), 0
+              ).toFixed(2) + ' USDT'
+          },
+          short: {
+            total_trades: this.matchingCandles.filter(
+              c => c.trade_result?.entry.side === 'SHORT'
+            ).length,
+            profitable_trades: this.matchingCandles.filter(
+              c => c.trade_result?.entry.side === 'SHORT' && 
+                parseFloat(c.trade_result.trailing_details.trade_summary.PNL) > 0
+            ).length,
+            total_pnl: this.matchingCandles
+              .filter(c => c.trade_result?.entry.side === 'SHORT')
+              .reduce((sum, trade) => 
+                sum + (trade.trade_result ? parseFloat(trade.trade_result.trailing_details.trade_summary.PNL) : 0), 0
+              ).toFixed(2) + ' USDT'
           }
-        );
-
-        if (exit) {
-          const { pnl, pnl_percentage } = this.calculatePnL(
-            threshold_crossed.entry_price,
-            exit.price,
-            threshold_crossed.direction,
-            tradeSize
-          );
-
-          // Update balance
-          this.currentBalance += pnl;
-
-          const tradeResult: TradeResult & { balance_after_trade: number } = {
-            entry: {
-              price: threshold_crossed.entry_price,
-              time: threshold_crossed.crossed_at,
-              side: threshold_crossed.direction,
-              candles_until_entry: threshold_crossed.candles_until_cross,
-            },
-            exit: {
-              price: exit.price,
-              time: exit.time,
-              type: exit.type,
-              candles_until_exit: exit.candles_until_exit,
-              trailing_stops: exit.trailing_stops,
-            },
-            pnl,
-            pnl_percentage,
-            trailing_stop_history: exit.trailing_stops,
-            max_profit_reached: exit.price - threshold_crossed.entry_price,
-            max_profit_percentage:
-              ((exit.price - threshold_crossed.entry_price) /
-                threshold_crossed.entry_price) *
-              100,
-            final_profit: exit.price - threshold_crossed.entry_price,
-            final_profit_percentage:
-              ((exit.price - threshold_crossed.entry_price) /
-                threshold_crossed.entry_price) *
-              100,
-            trailing_metrics: {
-              total_trails: exit.trailing_stops.length - 1,
-              average_trail_distance:
-                exit.trailing_stops.reduce(
-                  (
-                    sum: number,
-                    update: TrailingStopUpdate,
-                    idx: number,
-                    arr: TrailingStopUpdate[]
-                  ) =>
-                    idx > 0
-                      ? sum + Math.abs(update.price - arr[idx - 1].price)
-                      : sum,
-                  0
-                ) /
-                (exit.trailing_stops.length - 1),
-              largest_trail: Math.max(
-                ...exit.trailing_stops
-                  .slice(1)
-                  .map((update) =>
-                    Math.abs(update.price - exit.trailing_stops[0].price)
-                  )
-              ),
-              profit_saved_by_trailing:
-                ((exit.price - threshold_crossed.entry_price) /
-                  threshold_crossed.entry_price) *
-                100,
-            },
-            balance_after_trade: this.currentBalance,
-          };
-
-          console.log(`
-                TRADE COMPLETED:
-                Entry: ${tradeResult.entry.side} @ ${
-            tradeResult.entry.price
-          } (${tradeResult.entry.time})
-                Exit: ${tradeResult.exit.type} @ ${tradeResult.exit.price} (${
-            tradeResult.exit.time
-          })
-                PnL: ${tradeResult.pnl.toFixed(
-                  2
-                )} USDT (${tradeResult.pnl_percentage.toFixed(2)}%)
-                Balance: ${this.currentBalance.toFixed(2)} USDT
-                `);
-
-          this.matchingCandles.push({
-            timestamp: legendCandle.timestamp,
-            open: currentCandle.open,
-            close: currentCandle.close,
-            movement: currentDiff,
-            dynamicThreshold: dynamicThreshold,
-            averageMovement: averageDiff,
-            numPreviousCandles: config.lookbackPeriod.candles,
-            upward_movementThreshold: legendCandle.upward_movementThreshold,
-            downward_movementThreshold: legendCandle.downward_movementThreshold,
-            entry_instructions: {
-              long: `Enter LONG if price crosses above ${legendCandle.upward_movementThreshold.toFixed(
-                2
-              )} USDT`,
-              short: `Enter SHORT if price crosses below ${legendCandle.downward_movementThreshold.toFixed(
-                2
-              )} USDT`,
-            },
-            threshold_crossed,
-            trade_result: tradeResult,
-          });
         }
-      }
-    } else {
-      console.log(
-        `❌ Failed: Movement (${currentDiff.toFixed(
-          2
-        )}%) <= Dynamic Threshold (${dynamicThreshold.toFixed(2)}%)`
-      );
-      console.log('-------------------');
+      },
+      detailed_trades: this.matchingCandles
+        .filter(c => c.trade_result !== null)
+        .map(c => c.trade_result)
+    };
+
+    // Save to file
+    const resultsDir = path.join(__dirname, '../results');
+    const symbolDir = path.join(resultsDir, this.symbol);
+    const resultFile = path.join(
+      symbolDir, 
+      `${this.runConfig.singleBacktest?.timeframe || 'default'}_results.json`
+    );
+
+    // Create directories if they don't exist
+    if (!fs.existsSync(resultsDir)) {
+      await fs.promises.mkdir(resultsDir);
     }
+    if (!fs.existsSync(symbolDir)) {
+      await fs.promises.mkdir(symbolDir);
+    }
+
+    await fs.promises.writeFile(
+      resultFile,
+      JSON.stringify(formattedResults, null, 2)
+    );
+
+    console.log(`\nResults saved to ${resultFile}`);
+  }
+
+  private createTradeExit(
+    candle: Candle,
+    stopLossPrice: number,
+    candlesUntilExit: number,
+    trailingHistory: (TrailingStopUpdate & { triggerCandle?: Candle })[]
+  ): TradeExit {
+    trailingHistory.push({
+      price: stopLossPrice,
+      time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
+      type: 'HIT',
+      market_price: stopLossPrice,
+      profit_at_update: 0  // This will be calculated in processTradeResult
+    });
+
+    return {
+      price: stopLossPrice,
+      time: moment(candle.openTime).format('YYYY-MM-DD HH:mm:ss'),
+      type: 'TRAILING_STOP',
+      candles_until_exit: candlesUntilExit,
+      trailing_stops: trailingHistory
+    };
+  }
+
+  private processTradeResult(
+    entry: {
+      direction: 'LONG' | 'SHORT';
+      crossed_at: string;
+      entry_price: number;
+      candles_until_cross: number;
+      entryCandleData?: {
+        open: number;
+        high: number;
+        low: number;
+        close: number;
+        volume: number;
+      };
+    },
+    exit: TradeExit,
+    dynamicThreshold: number,
+    currentDiff: number,
+    legendCandleData: {
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }
+  ): TradeDetailsResult {
+    const { pnl, pnl_percentage } = this.calculatePnL(
+      entry.entry_price,
+      exit.price,
+      entry.direction,
+      1
+    );
+
+    // Format trails data
+    const trails = exit.trailing_stops
+      .filter(stop => stop.type !== 'INITIAL' && stop.type !== 'HIT')
+      .map((stop: TrailingStopUpdate & { triggerCandle?: Candle }, index) => {
+        // Calculate profit for this specific trail
+        const profitAtThisTrail = entry.direction === 'LONG'
+          ? stop.price - exit.trailing_stops[index].price  // For LONG: new_stop - old_stop
+          : exit.trailing_stops[index].price - stop.price; // For SHORT: old_stop - new_stop
+
+        // Calculate cumulative profit up to this trail
+        const profitSoFar = entry.direction === 'LONG'
+          ? stop.price - entry.entry_price  // For LONG: current_stop - entry
+          : entry.entry_price - stop.price; // For SHORT: entry - current_stop
+
+        return {
+          trail_number: index + 1,
+          time: stop.time,
+          triggerValue: stop.market_price.toString(),
+          old_stop_loss: exit.trailing_stops[index].price.toString(),
+          new_stop_loss: stop.price.toString(),
+          stop_loss_movement: `${((Math.abs(stop.price - exit.trailing_stops[index].price) / 
+            exit.trailing_stops[index].price) * 100).toFixed(2)}%`,
+          profit_at_this_trail: `${profitAtThisTrail.toFixed(2)} USDT`,  // Profit from this trail only
+          TriggerCandleDetails: stop.triggerCandle ? {
+            open: stop.triggerCandle.open.toString(),
+            high: stop.triggerCandle.high.toString(),
+            low: stop.triggerCandle.low.toString(),
+            close: stop.triggerCandle.close.toString(),
+            volume: stop.triggerCandle.volume.toString()
+          } : {
+            open: "",
+            high: "",
+            low: "",
+            close: "",
+            volume: ""
+          },
+          trail_details: {
+            triggered_by: `trigger${(index + 1).toString().padStart(2, '0')}`,
+            stoploss_distanceFrom_entry: `${((Math.abs(stop.price - entry.entry_price) / 
+              entry.entry_price) * 100).toFixed(2)}%`,
+            profit_so_far: `${profitSoFar.toFixed(2)} USDT`  // Cumulative profit up to this trail
+          }
+        };
+      });
+
+    return {
+      trade_Number: this.matchingCandles.length + 1,
+      timestamp: entry.crossed_at,
+      LegendCandle: {
+        currentDynamicThreshold: dynamicThreshold.toString(),
+        LegendCandleDifference: currentDiff.toFixed(2),
+        LegendCandleDetails: {
+          open: legendCandleData.open.toString(),
+          high: legendCandleData.high.toString(),
+          low: legendCandleData.low.toString(),
+          close: legendCandleData.close.toString(),
+          volume: legendCandleData.volume.toString()
+        }
+      },
+      entry: {
+        reason: entry.direction === 'LONG' ? 'UpwardThresholdMet' : 'DownwardThresholdMet',
+        side: entry.direction,
+        price: entry.entry_price,
+        formatted_price: `${entry.entry_price.toFixed(2)} USDT`,
+        time: entry.crossed_at,
+        PositionEntryCandleDetails: entry.entryCandleData ? {
+          open: entry.entryCandleData.open.toString(),
+          high: entry.entryCandleData.high.toString(),
+          low: entry.entryCandleData.low.toString(),
+          close: entry.entryCandleData.close.toString(),
+          volume: entry.entryCandleData.volume.toString()
+        } : {
+          open: "",
+          high: "",
+          low: "",
+          close: "",
+          volume: ""
+        },
+        initial_stop: {
+          price: exit.trailing_stops[0].price.toString(),
+          distance_from_entry: `${(
+            entry.direction === 'LONG' 
+              ? -(entry.entry_price - exit.trailing_stops[0].price)  // For LONG: entry - stop
+              : -(exit.trailing_stops[0].price - entry.entry_price)  // For SHORT: stop - entry
+          ).toFixed(2)} USDT`,
+          percentage_from_entry: `${(
+            entry.direction === 'LONG'
+              ? -((entry.entry_price - exit.trailing_stops[0].price) / entry.entry_price * 100)  // For LONG
+              : -((exit.trailing_stops[0].price - entry.entry_price) / entry.entry_price * 100)  // For SHORT
+          ).toFixed(2)}%`
+        }
+      },
+      trailing_details: {
+        trails,
+        exit_details: {
+          time: exit.time,
+          exit_reason: `stoploss ${trails.length} hit`,
+          final_stop_loss_price: exit.price.toString(),
+          total_trails_before_exit: trails.length,
+          PNL_in_percent: `${pnl_percentage.toFixed(2)}%`,
+          PNL: `${pnl.toFixed(2)} USDT`
+        },
+        trade_summary: {
+          entry_price: entry.entry_price,
+          initialStoploss: exit.trailing_stops[0].price.toString(),
+          numberOfTrails: trails.length,
+          final_stop_loss_price: exit.price.toString(),
+          PNL_in_percent: `${pnl_percentage.toFixed(2)}%`,
+          PNL: `${pnl.toFixed(2)} USDT`
+        }
+      },
+      balance_after_trade: this.currentBalance + pnl
+    };
+  }
+
+  private storeMatchingCandle(
+    currentCandle: Candle,
+    legendCandle: {
+      timestamp: string;
+      close: number;
+      upward_movementThreshold: number;
+      downward_movementThreshold: number;
+    },
+    threshold_crossed: {
+      direction: 'LONG' | 'SHORT';
+      crossed_at: string;
+      entry_price: number;
+      candles_until_cross: number;
+    },
+    tradeResult: TradeDetailsResult,
+    dynamicThreshold: number,
+    averageDiff: number
+  ): void {
+    this.matchingCandles.push({
+      timestamp: legendCandle.timestamp,
+      open: currentCandle.open,
+      close: currentCandle.close,
+      movement: Math.abs((currentCandle.close - currentCandle.open) / currentCandle.open) * 100,
+      dynamicThreshold,
+      averageMovement: averageDiff,
+      numPreviousCandles: this.runConfig.strategy.lookbackPeriod.candles,
+      upward_movementThreshold: legendCandle.upward_movementThreshold,
+      downward_movementThreshold: legendCandle.downward_movementThreshold,
+      entry_instructions: {
+        long: `Enter LONG if price crosses above ${legendCandle.upward_movementThreshold.toFixed(2)} USDT`,
+        short: `Enter SHORT if price crosses below ${legendCandle.downward_movementThreshold.toFixed(2)} USDT`
+      },
+      threshold_crossed,
+      trade_result: tradeResult
+    });
   }
 
   async findMatchingCandles(): Promise<void> {
-    const lookbackPeriod = config.lookbackPeriod.candles + 10;
+    const lookbackPeriod = this.runConfig.strategy.lookbackPeriod.candles + 10;
 
     for (let i = lookbackPeriod; i < this.candles.length; i++) {
       const currentCandle = this.candles[i];
@@ -540,292 +687,23 @@ Required: >${dynamicThreshold.toFixed(2)}%`);
       await this.processCandle(currentCandle, lookbackCandles, i);
     }
 
-    // Calculate trade statistics with balance tracking
-    const resultsFile = path.join(__dirname, '../matching_candles.json');
-    const balanceHistory = this.matchingCandles
-      .filter((c) => c.trade_result !== null)
-      .map((c) => ({
-        timestamp: c.timestamp,
-        balance_before:
-          c.trade_result!.balance_after_trade - c.trade_result!.pnl,
-        balance_after: c.trade_result!.balance_after_trade,
-        pnl: c.trade_result!.pnl,
-        trade_type: c.trade_result!.exit.type,
-        trade_side: c.trade_result!.entry.side,
-      }));
-
-    const tradeDetails = this.matchingCandles.map((candle) => ({
-      timestamp: candle.timestamp,
-      entry: {
-        price: candle.trade_result?.entry.price,
-        time: candle.trade_result?.entry.time,
-        side: candle.trade_result?.entry.side,
-        formatted_price: `${candle.trade_result?.entry.price.toFixed(2)} USDT`
-      },
-      trailing_details: candle.trade_result ? {
-        initial_stop: {
-          price: candle.trade_result.trailing_stop_history[0].price.toFixed(2),
-          time: candle.trade_result.trailing_stop_history[0].time,
-          distance_from_entry: `${(Math.abs(candle.trade_result.trailing_stop_history[0].price - candle.trade_result.entry.price)).toFixed(2)} USDT`,
-          percentage_from_entry: `${((Math.abs(candle.trade_result.trailing_stop_history[0].price - candle.trade_result.entry.price) / candle.trade_result.entry.price) * 100).toFixed(2)}%`
-        },
-        trails: candle.trade_result.trailing_stop_history.slice(1, -1).map((update, index) => ({
-          trail_number: index + 1,
-          time: update.time,
-          market_price: update.market_price.toFixed(2),
-          old_stop_loss: update.price.toFixed(2),
-          new_stop_loss: candle.trade_result!.trailing_stop_history[index + 2].price.toFixed(2),
-          stop_loss_movement: `${(Math.abs(candle.trade_result!.trailing_stop_history[index + 2].price - update.price)).toFixed(2)} USDT`,
-          profit_at_trail: `${update.profit_at_update.toFixed(2)}%`,
-          price_movement_from_entry: `${(Math.abs(update.market_price - candle.trade_result!.entry.price)).toFixed(2)} USDT`,
-          price_movement_percentage: `${((Math.abs(update.market_price - candle.trade_result!.entry.price) / candle.trade_result!.entry.price) * 100).toFixed(2)}%`,
-          trail_details: {
-            triggered_by: update.type === 'TRAIL_UP' ? 'Price moved up' : 'Price moved down',
-            trail_distance: `${(Math.abs(candle.trade_result!.trailing_stop_history[index + 2].price - update.price)).toFixed(2)} USDT`,
-            trail_percentage: `${((Math.abs(candle.trade_result!.trailing_stop_history[index + 2].price - update.price) / update.price) * 100).toFixed(2)}%`
-          }
-        })),
-        exit_details: {
-          time: candle.trade_result.exit.time,
-          final_stop_loss: candle.trade_result.exit.price.toFixed(2),
-          market_price_at_exit: candle.trade_result.trailing_stop_history[candle.trade_result.trailing_stop_history.length - 1].market_price.toFixed(2),
-          total_trails_before_exit: candle.trade_result.trailing_metrics.total_trails,
-          max_profit_seen: `${candle.trade_result.max_profit_percentage.toFixed(2)}%`,
-          final_profit: `${candle.trade_result.pnl.toFixed(2)} USDT (${candle.trade_result.pnl_percentage.toFixed(2)}%)`,
-          trail_efficiency: `${candle.trade_result.trailing_metrics.profit_saved_by_trailing.toFixed(2)}%`,
-          exit_reason: candle.trade_result.trailing_stop_history[candle.trade_result.trailing_stop_history.length - 1].type === 'HIT' ? 'Stop Loss Hit' : 'Market Reversed'
-        },
-        trail_summary: {
-          total_trails: candle.trade_result.trailing_metrics.total_trails,
-          average_trail_distance: candle.trade_result.trailing_metrics.average_trail_distance.toFixed(2),
-          largest_trail: candle.trade_result.trailing_metrics.largest_trail.toFixed(2),
-          profit_saved_by_trailing: candle.trade_result.trailing_metrics.profit_saved_by_trailing.toFixed(2),
-          total_price_movement: `${(Math.abs(candle.trade_result.trailing_stop_history[candle.trade_result.trailing_stop_history.length - 1].market_price - candle.trade_result.entry.price)).toFixed(2)} USDT`,
-          total_stop_loss_movement: `${(Math.abs(candle.trade_result.exit.price - candle.trade_result.trailing_stop_history[0].price)).toFixed(2)} USDT`
-        }
-      } : null,
-      balance_after_trade: candle.trade_result?.balance_after_trade
-    }));
-
-    await fs.promises.writeFile(
-      resultsFile,
-      JSON.stringify(
-        {
-          config: {
-            symbol: this.symbol,
-            threshold: config.lookbackPeriod.threshold,
-            num_previous_candles: config.lookbackPeriod.candles,
-            initial_balance: config.account.initialBalance,
-          },
-          trade_performance: {
-            total_trades: this.matchingCandles.length,
-            profitable_trades: this.matchingCandles.filter(
-              c => c.trade_result && c.trade_result.pnl > 0
-            ).length,
-            unprofitable_trades: this.matchingCandles.filter(
-              c => c.trade_result && c.trade_result.pnl <= 0
-            ).length,
-            win_rate: ((this.matchingCandles.filter(
-              c => c.trade_result && c.trade_result.pnl > 0
-            ).length / this.matchingCandles.length) * 100).toFixed(2) + '%',
-            by_direction: {
-              long: {
-                total_trades: this.matchingCandles.filter(
-                  c => c.trade_result?.entry.side === 'LONG'
-                ).length,
-                profitable_trades: this.matchingCandles.filter(
-                  c => c.trade_result?.entry.side === 'LONG' && c.trade_result.pnl > 0
-                ).length,
-                total_pnl: this.matchingCandles
-                  .filter(c => c.trade_result?.entry.side === 'LONG')
-                  .reduce((sum, trade) => sum + (trade.trade_result?.pnl || 0), 0)
-                  .toFixed(2) + ' USDT'
-              },
-              short: {
-                // Similar structure for short trades
-              }
-            }
-          },
-          detailed_trades: tradeDetails,
-        },
-        null,
-        2
-      )
-    );
-
-    // Print summary to console
-    console.log('\nTrade Performance Summary:');
-    console.log('========================');
-    console.log(`Total Trades: ${this.matchingCandles.length}`);
-    console.log(
-      `Total PnL: ${this.matchingCandles
-        .reduce((sum, trade) => sum + (trade.trade_result?.pnl || 0), 0)
-        .toFixed(2)} USDT (${(
-        (this.matchingCandles.reduce(
-          (sum, trade) => sum + (trade.trade_result?.pnl || 0),
-          0
-        ) /
-          this.currentBalance) *
-        100
-      ).toFixed(2)}%)`
-    );
-    console.log(
-      `Average PnL per Trade: ${(
-        this.matchingCandles.reduce(
-          (sum, trade) => sum + (trade.trade_result?.pnl || 0),
-          0
-        ) / this.matchingCandles.length
-      ).toFixed(2)} USDT (${(
-        (this.matchingCandles.reduce(
-          (sum, trade) => sum + (trade.trade_result?.pnl || 0),
-          0
-        ) /
-          this.matchingCandles.length /
-          this.currentBalance) *
-        100
-      ).toFixed(2)}%)`
-    );
-
-    console.log('\nOutcomes by Direction:');
-    console.log('LONG Trades:');
-    console.log(
-      `- Total: ${
-        this.matchingCandles.filter(
-          (c) => c.trade_result?.entry.side === 'LONG'
-        ).length
-      }`
-    );
-
-    // Count profitable trades instead of takeprofit/stoploss
-    console.log(
-      `- Profitable Trades: ${
-        this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'LONG' &&
-            c.trade_result.pnl > 0
-        ).length
-      } (${(
-        (this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'LONG' &&
-            c.trade_result.pnl > 0
-        ).length /
-          this.matchingCandles.filter(
-            (c) => c.trade_result?.entry.side === 'LONG'
-          ).length) *
-        100
-      ).toFixed(2)}%)`
-    );
-
-    console.log(
-      `- Unprofitable Trades: ${
-        this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'LONG' &&
-            c.trade_result.pnl <= 0
-        ).length
-      } (${(
-        (this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'LONG' &&
-            c.trade_result.pnl <= 0
-        ).length /
-          this.matchingCandles.filter(
-            (c) => c.trade_result?.entry.side === 'LONG'
-          ).length) *
-        100
-      ).toFixed(2)}%)`
-    );
-
-    console.log(
-      `- PnL: ${this.matchingCandles
-        .filter((c) => c.trade_result?.entry.side === 'LONG')
-        .reduce((sum, trade) => sum + (trade.trade_result?.pnl || 0), 0)
-        .toFixed(2)} USDT`
-    );
-
-    console.log('\nSHORT Trades:');
-    console.log(
-      `- Total: ${
-        this.matchingCandles.filter(
-          (c) => c.trade_result?.entry.side === 'SHORT'
-        ).length
-      }`
-    );
-
-    // Count profitable trades instead of takeprofit/stoploss
-    console.log(
-      `- Profitable Trades: ${
-        this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'SHORT' &&
-            c.trade_result.pnl > 0
-        ).length
-      } (${(
-        (this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'SHORT' &&
-            c.trade_result.pnl > 0
-        ).length /
-          this.matchingCandles.filter(
-            (c) => c.trade_result?.entry.side === 'SHORT'
-          ).length) *
-        100
-      ).toFixed(2)}%)`
-    );
-
-    console.log(
-      `- Unprofitable Trades: ${
-        this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'SHORT' &&
-            c.trade_result.pnl <= 0
-        ).length
-      } (${(
-        (this.matchingCandles.filter(
-          (c) =>
-            c.trade_result?.entry.side === 'SHORT' &&
-            c.trade_result.pnl <= 0
-        ).length /
-          this.matchingCandles.filter(
-            (c) => c.trade_result?.entry.side === 'SHORT'
-          ).length) *
-        100
-      ).toFixed(2)}%)`
-    );
-
-    console.log(
-      `- PnL: ${this.matchingCandles
-        .filter((c) => c.trade_result?.entry.side === 'SHORT')
-        .reduce((sum, trade) => sum + (trade.trade_result?.pnl || 0), 0)
-        .toFixed(2)} USDT`
-    );
-
-    console.log(`\nResults saved to ${resultsFile}`);
-
-    // Update console output
-    console.log('\nAccount Performance:');
-    console.log(
-      `Initial Balance: ${config.account.initialBalance.toFixed(2)} USDT`
-    );
-    console.log(`Final Balance: ${this.currentBalance.toFixed(2)} USDT`);
-    console.log(
-      `Total Return: ${(
-        ((this.currentBalance - config.account.initialBalance) /
-          config.account.initialBalance) *
-        100
-      ).toFixed(2)}%`
-    );
-    console.log(
-      `Absolute Return: ${(
-        this.currentBalance - config.account.initialBalance
-      ).toFixed(2)} USDT`
-    );
+    await this.saveResults(this.matchingCandles);
   }
 
   private calculateTradeSize(entryPrice: number): number {
     const positionSize =
       (this.currentBalance * config.account.positionSizePercent) / 100;
     return positionSize / entryPrice; // Convert USDT to token quantity
+  }
+
+  private updateBalance(tradeResult: TradeDetailsResult): void {
+    this.currentBalance = tradeResult.balance_after_trade;
+    
+    this.balanceHistory.push({
+      timestamp: tradeResult.trailing_details.exit_details.time,
+      balance: this.currentBalance,
+      trade_pnl: parseFloat(tradeResult.trailing_details.trade_summary.PNL),
+      trade_type: 'TRAILING_STOP'
+    });
   }
 }
